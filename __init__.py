@@ -15,8 +15,9 @@ SHARDING_FACTOR = 2
 REPLICATION_FACTOR = 1
 
 
-socketio = SocketIO(app, logger=True, async_mode='eventlet')
+socketio = SocketIO(app, logger=True, engineio_logger=True, async_mode='eventlet')
 connected_users = {}
+connection_lock = Lock()
 
 # storage dict contains:
 # size of shards kept by client on his machine
@@ -24,14 +25,19 @@ connected_users = {}
 @socketio.on('connect')
 def handle_join(storage_data):
     connection_id = request.sid
+    connection_lock.acquire()
     connected_users[connection_id] = {**storage_data}
+    connection_lock.release()
     emit('users_count', {'users_count': len(connected_users)})
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    connection_lock.acquire()
     del connected_users[request.sid]
-    emit('users_count', {'users_count': len(connected_users)})
+    amount = len(connected_users)
+    connection_lock.release()
+    emit('users_count', {'users_count': amount})
 
 # transmission of a shard
 # shard_dict should contain this data
@@ -59,18 +65,19 @@ def handle_save_shard(shard_dict_string):
 
     # transforming to list to sort
     connected_users_list = []
-    for user in connected_users.keys():
-        connected_users_list.append((user, connected_users[user]['client_kept'], connected_users[user]['client_saved']))
+    with connection_lock:
+        for user in connected_users.keys():
+            connected_users_list.append((user, connected_users[user]['client_kept'], connected_users[user]['client_saved']))
 
     # the top of the sorted list are the ones who kept the least and saved the most data into the network;
     # they must be our choice
     connected_users_list.sort(key=lambda x: x[1] - x[2] * REPLICATION_FACTOR)
 
     saved_amount = 0
-    for user in connected_users_list:
+    for user, _, __ in connected_users_list:
         # we don't reuse the same user to store his data
-        if user[0] == sender_sid:
-            continue
+        #if user == sender_sid:
+        # continue
 
         # the has_shard is a "request" which is needed to check, if the client has some shard of file we're trying to save
         response = socketio.call('has_shard', {'FilePublicKey': shard_dict['FilePublicKey']}, to=user)
@@ -97,8 +104,9 @@ def handle_save_shard(shard_dict_string):
 def handle_saved_size(sizes_dict):
     sid = request.sid
 
-    connected_users[sid]['client_kept'] = sizes_dict['client_kept']
-    connected_users[sid]['client_saved'] = sizes_dict['client_saved']
+    with connection_lock:
+        connected_users[sid]['client_kept'] = sizes_dict['client_kept']
+        connected_users[sid]['client_saved'] = sizes_dict['client_saved']
 
     emit('saved_size_ack', {'response': 'saved sizes updates', 'success': True}, to=sid)
 
@@ -107,7 +115,10 @@ def handle_saved_size(sizes_dict):
 # it makes him decrypt a small 16-bytes message; if it succeeds,
 def check_file_ownership(owner_sid, file_public_key) -> bool:
     # there are no blocking broadcast call, so...
-    for user in connected_users.keys():
+    with connection_lock:
+        connected_user_sids = connected_users.keys()
+
+    for user in connected_user_sids:
         if user != owner_sid:
             response = socketio.call('has_shard', {'FilePublicKey': file_public_key}, to=user)
             if response:
@@ -167,6 +178,6 @@ def handle_check_file(file_public_key):
 
 
 if __name__ == '__main__':
-    socketio.run(app, host="0.0.0.0", port=5000)
+    socketio.run(app, port=5000)
 
 
