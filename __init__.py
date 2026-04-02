@@ -114,10 +114,10 @@ def handle_saved_size(sizes_dict):
 # this mechanism is designed to proof that owner_sid is truly an owner of file file_public_key
 # it makes him decrypt a small 16-bytes message; if it succeeds,
 def check_file_ownership(owner_sid, file_public_key) -> bool:
-    # there are no blocking broadcast call, so...
     with connection_lock:
         connected_user_sids = connected_users.keys()
 
+    # there are no blocking broadcast call, so...
     for user in connected_user_sids:
         if user != owner_sid:
             response = socketio.call('has_shard', {'FilePublicKey': file_public_key}, to=user)
@@ -125,40 +125,43 @@ def check_file_ownership(owner_sid, file_public_key) -> bool:
                 # response from client on this moment is base64 string
                 enc_proof_bytes_b64 = socketio.call(
                     'get_proof_bytes', {'FilePublicKey': file_public_key}, to=user
-                )
+                )[0]
                 dec_proof_bytes_b64 = socketio.call(
                     'check_proof_bytes', {'FilePublicKey': file_public_key, 'ProofBytes': enc_proof_bytes_b64}, to=owner_sid
-                )
+                )[0]
                 # verdict: is the one who is owner is truly an owner?
                 result = socketio.call(
                     'compare_check_bytes', {'FilePublicKey': file_public_key, 'ProofBytesDecrypted': dec_proof_bytes_b64}, to=user
-                )
+                )[0]
                 return result
 
     return False
 
 
-# this "route" gets shards and returns it to request sender
-@socketio.on('get_file')
-def handle_get_file(file_public_key):
+# this "route" gets one shard and returns it to the one who requested it
+# Input: {'FilePublicKey': hex, 'ShardIndex': int}
+@socketio.on('get_shard')
+def handle_get_shard(file_info):
     sid = request.sid
+
+    file_public_key = file_info['FilePublicKey']
+    shard_index = file_info['ShardIndex']
+
     is_owner = check_file_ownership(sid, file_public_key)
 
-    shards = []
     if is_owner:
-        for i in range(SHARDING_FACTOR):
-            have_found = False
-            for user in connected_users.keys():
-                response = socketio.call('has_shard', {'FilePublicKey': file_public_key, 'ShardIndex': i}, to=user)
-                if response:
-                    emit('get_file_ack', {'success': True, 'response': f'Found shard index {i}'}, to=sid)
-                    shards.append(socketio.call('get_shard', file_public_key, to=user))
-                    have_found = True
-                    break
-            if not have_found:
-                emit('get_file_ack', {'success': False, 'response': f'Not found shard index {i}'}, to=sid)
+        with connection_lock:
+            connected_users_list = connected_users.keys()
 
-        emit('get_file', shards, to=sid)
+        for user in connected_users_list:
+            response = socketio.call('has_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=sid)
+            if response:
+                emit('get_shard_ack', {'success': True, 'response': 'shard holder was found'}, to=sid)
+                shard = socketio.call('get_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=sid)
+                emit('receive_shard', shard, to=user)
+                return
+
+        socketio.emit('get_shard_ack', {'success': False, 'response': "shard holder wasn't found"})
 
 
 @socketio.on('delete_file')
