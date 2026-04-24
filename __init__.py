@@ -1,11 +1,7 @@
-import base64
-
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from uuid import uuid4
-from flask_socketio import SocketIO, send, emit, join_room, leave_room, rooms
-from time import sleep
-from threading import Thread, Lock
-from datetime import datetime, timedelta
+from flask_socketio import SocketIO, emit
+from threading import Lock
 import json
 
 app = Flask(__name__)
@@ -15,7 +11,7 @@ SHARDING_FACTOR = 2
 REPLICATION_FACTOR = 1
 
 
-socketio = SocketIO(app, logger=True, engineio_logger=True, async_mode='eventlet')
+socketio = SocketIO(app, logger=True, engineio_logger=True, async_mode='eventlet', max_http_buffer_size=16 * 1024 * 1024)
 connected_users = {}
 connection_lock = Lock()
 
@@ -76,8 +72,8 @@ def handle_save_shard(shard_dict_string):
     saved_amount = 0
     for user, _, __ in connected_users_list:
         # we don't reuse the same user to store his data
-        #if user == sender_sid:
-        # continue
+        if user == sender_sid:
+            continue
 
         # the has_shard is a "request" which is needed to check, if the client has some shard of file we're trying to save
         response = socketio.call('has_shard', {'FilePublicKey': shard_dict['FilePublicKey']}, to=user)
@@ -85,8 +81,9 @@ def handle_save_shard(shard_dict_string):
         # this already means that we can save the shard
         if not response:
             emit('save_shard', shard_dict, to=user)
-            saved_amount += 1
             print('saving a shard to another user')
+
+        saved_amount += 1
 
         # once we've saved to enough nodes, we can say that we've successfully saved a shard
         if saved_amount == REPLICATION_FACTOR:
@@ -100,7 +97,7 @@ def handle_save_shard(shard_dict_string):
 
 
 # This msg updates information on user
-@socketio.on('saved_size')
+@socketio.on('update_saved_size')
 def handle_saved_size(sizes_dict):
     sid = request.sid
 
@@ -112,28 +109,27 @@ def handle_saved_size(sizes_dict):
 
 
 # this mechanism is designed to proof that owner_sid is truly an owner of file file_public_key
-# it makes him decrypt a small 16-bytes message; if it succeeds,
+# it makes him decrypt a small 16 bytes message; if it succeeds, True is returned, in any other case
+# False is returned
+# FIXME: in future its better to generate proof bytes here instead of asking checker_user to do so
 def check_file_ownership(owner_sid, file_public_key) -> bool:
     with connection_lock:
         connected_user_sids = connected_users.keys()
+    for checker_user in connected_user_sids:
+       if checker_user != owner_sid:
+           response = socketio.call('has_shard', {'FilePublicKey': file_public_key}, to=checker_user)
+           if response:
+               # generating random 16 bytes
 
-    # there are no blocking broadcast call, so...
-    for user in connected_user_sids:
-        if user != owner_sid:
-            response = socketio.call('has_shard', {'FilePublicKey': file_public_key}, to=user)
-            if response:
                 # response from client on this moment is base64 string
-                enc_proof_bytes_b64 = socketio.call(
-                    'get_proof_bytes', {'FilePublicKey': file_public_key}, to=user
-                )[0]
-                dec_proof_bytes_b64 = socketio.call(
-                    'check_proof_bytes', {'FilePublicKey': file_public_key, 'ProofBytes': enc_proof_bytes_b64}, to=owner_sid
-                )[0]
+               enc_proof_bytes_b64, dec_proof_bytes_b64 = socketio.call(
+                   'get_proof_bytes', {'FilePublicKey': file_public_key}, to=checker_user
+               )[0]
+               check_bytes = socketio.call(
+                   'check_proof_bytes', {'FilePublicKey': file_public_key, 'ProofBytes': enc_proof_bytes_b64}, to=owner_sid
+               )[0]
                 # verdict: is the one who is owner is truly an owner?
-                result = socketio.call(
-                    'compare_check_bytes', {'FilePublicKey': file_public_key, 'ProofBytesDecrypted': dec_proof_bytes_b64}, to=user
-                )[0]
-                return result
+               return dec_proof_bytes_b64 == check_bytes
 
     return False
 
@@ -173,11 +169,15 @@ def handle_delete_file(file_public_key):
         emit('delete_shard', file_public_key, broadcast=True)
 
 
-# has_shard message is already enough for checking file status.
-# response message can be just ignored
-@socketio.on('check_file')
-def handle_check_file(file_public_key):
-    emit('has_shard', {'FilePublicKey': file_public_key}, broadcast=True)
+@socketio.on('check_shard_status')
+def handle_check_shard_status(file_public_key, index):
+    count = 0
+    for user in connected_users.keys():
+        response = socketio.call('has_shard', {'FilePublicKey': file_public_key, 'ShardIndex': index}, to=user)
+        if response:
+            count += 1
+
+    socketio.emit('check_shard_status', count, to=index)
 
 
 if __name__ == '__main__':
