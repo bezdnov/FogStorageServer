@@ -8,6 +8,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = str(uuid4())
 
 SHARDING_FACTOR = 2
+# TEMPORAL
 REPLICATION_FACTOR = 1
 
 
@@ -137,11 +138,8 @@ def check_file_ownership(owner_sid, file_public_key) -> bool:
 # this "route" gets one shard and returns it to the one who requested it
 # Input: {'FilePublicKey': hex, 'ShardIndex': int}
 @socketio.on('get_shard')
-def handle_get_shard(file_info):
+def handle_get_shard(file_public_key, shard_index):
     sid = request.sid
-
-    file_public_key = file_info['FilePublicKey']
-    shard_index = file_info['ShardIndex']
 
     is_owner = check_file_ownership(sid, file_public_key)
 
@@ -149,15 +147,20 @@ def handle_get_shard(file_info):
         with connection_lock:
             connected_users_list = connected_users.keys()
 
+        found_shard = False
+
         for user in connected_users_list:
-            response = socketio.call('has_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=sid)
+            response = socketio.call('has_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=user)
             if response:
                 emit('get_shard_ack', {'success': True, 'response': 'shard holder was found'}, to=sid)
-                shard = socketio.call('get_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=sid)
-                emit('receive_shard', shard, to=user)
-                return
-
-        socketio.emit('get_shard_ack', {'success': False, 'response': "shard holder wasn't found"})
+                shard = socketio.call('give_shard', {'FilePublicKey': file_public_key, 'ShardIndex': shard_index}, to=user)
+                emit('get_shard', shard, to=sid)
+                found_shard = True
+                break
+        if not found_shard:
+            socketio.emit('get_shard_ack', {'success': False, 'response': "shard holder wasn't found"})
+    else:
+        socketio.emit('get_shard', {'success': False, 'response': "Not enough peers or you're lying"})
 
 
 @socketio.on('delete_file')
@@ -181,6 +184,6 @@ def handle_check_shard_status(file_public_key, index):
 
 
 if __name__ == '__main__':
-    socketio.run(app, port=5000)
+    socketio.run(app, host='0.0.0.0', port=5000)
 
 
